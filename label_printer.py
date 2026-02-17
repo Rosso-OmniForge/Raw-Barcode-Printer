@@ -7,6 +7,7 @@ Handles stock reconciliation and label printing with batch control
 import csv
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -18,6 +19,64 @@ class LabelPrinter:
         self.selected_printer = None
         self.items_data = {}
         self.stock_data = []
+
+        # TSPL uses dot coordinates; at 203dpi it's ~8 dots/mm.
+        # For a 40mm label width, that is ~320 dots.
+        self.label_width_dots = 320
+
+        # Global horizontal alignment tweak.
+        # If printing is shifted left/right, adjust this. Positive values shift RIGHT.
+        # 2mm at 203dpi ≈ 16 dots.
+        self.horizontal_shift_dots = 16
+
+        # Barcode horizontal placement.
+        # If the barcode looks too far right/left, adjust this.
+        # This does NOT affect the item code text (which is centered separately).
+        self.barcode_x_dots = 30
+
+    def _tspl_escape(self, s: str) -> str:
+        """Escape a string for inclusion inside TSPL double-quoted fields."""
+        return (s or "").replace('\\', '\\\\').replace('"', '\\"')
+
+    def _center_x_for_text(self, text: str, font: str, xmul: int = 1) -> int:
+        """Approximate centering for TSPL built-in fonts.
+
+        TSPL TEXT uses left-origin X. We estimate text width in dots using common
+        TSC font metrics; this may vary slightly by printer/firmware.
+        """
+        # Common approximate widths for TSC built-in fonts (dots per character)
+        font_char_width = {
+            '1': 8,
+            '2': 12,
+            '3': 16,
+            '4': 24,
+            '5': 32,
+            '6': 14,
+            '7': 14,
+            '8': 14,
+        }
+        char_w = font_char_width.get(str(font), 8) * max(1, int(xmul))
+        width = len(text or "") * char_w
+        x = int((self.label_width_dots - width) / 2)
+        return max(0, x)
+
+    def _center_x_for_code39(self, data: str, narrow: int = 1, wide: int = 2) -> int:
+        """Approximate centering for Code39 barcode.
+
+        Each Code39 character is 9 elements (3 wide, 6 narrow). Printers typically
+        add a narrow inter-character gap. Many firmwares also add start/stop.
+        This estimate is good enough to visually center across typical lengths.
+        """
+        n = max(1, int(narrow))
+        w = max(n, int(wide))
+
+        # Estimate including start/stop characters.
+        char_count = len(data or "") + 2
+        per_char_modules = (3 * w) + (6 * n)
+        inter_gap = n
+        width = (char_count * per_char_modules) + ((char_count - 1) * inter_gap)
+        x = int((self.label_width_dots - width) / 2)
+        return max(0, x)
         
     def find_printers(self) -> List[str]:
         """Detect all USB printers connected to the system"""
@@ -38,8 +97,8 @@ class LabelPrinter:
         print("  PRINTER TEST - Sending test label to each device")
         print("="*60)
         
-        # Create a simple test label matching the exact TSPL format from sample
-        test_tspl_template = 'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nCLS\\nTEXT 50,10,\\"3\\",0,1,1,\\"TEST PRINT\\"\\nBAR 20,40,280,2\\nTEXT 20,60,\\"4\\",0,1,1,\\"{}\\"\\nTEXT 20,100,\\"2\\",0,1,1,\\"Which printer produced\\"\\nTEXT 20,120,\\"2\\",0,1,1,\\"this label?\\"\\nPRINT 1\\n'
+        # Create a simple test label with initialization commands
+        test_tspl_template = f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0,0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\nTEXT 50,10,\\"3\\",0,1,1,\\"TEST PRINT\\"\\nBAR 20,40,280,2\\nTEXT 20,60,\\"4\\",0,1,1,\\"{{}}\\",\\nTEXT 20,100,\\"2\\",0,1,1,\\"Which printer produced\\"\\nTEXT 20,120,\\"2\\",0,1,1,\\"this label?\\"\\nPRINT 1\\n'
         
         for idx, printer in enumerate(self.printers, 1):
             printer_name = printer.split('/')[-1].upper()  # Extract 'LP0', 'LP2' etc
@@ -188,7 +247,12 @@ class LabelPrinter:
         return ''
     
     def load_stock_recon_data(self):
-        """Load stock reconciliation data with current_qty for recon comparison"""
+        """Load stock reconciliation data with current_qty for recon comparison.
+
+        Note: We also capture `valuation_rate` from this file to use as the label price.
+        The exported template may have different header casing (e.g. "Valuation Rate"
+        vs "valuation_rate"), so we normalize keys.
+        """
         print("\n📊 Loading stock reconciliation data...")
         
         try:
@@ -198,11 +262,11 @@ class LabelPrinter:
                 # Find the actual header line (the one with field names)
                 header_idx = -1
                 for idx, line in enumerate(lines):
-                    if 'item_code' in line.lower() and 'qty' in line.lower():
-                        # Check if this is the underscore-formatted header
-                        if '"item_code"' in line or 'item_code' in line:
-                            header_idx = idx
-                            break
+                    lower = line.lower()
+                    # Support both underscore headers and title-case headers
+                    if (('item_code' in lower and 'qty' in lower) or ('item code' in lower and 'quantity' in lower)):
+                        header_idx = idx
+                        break
                 
                 if header_idx == -1:
                     print("❌ Could not find header row")
@@ -214,11 +278,18 @@ class LabelPrinter:
                 self.stock_data = []
                 
                 for row in reader:
+                    # Normalize keys to handle different export header formats
+                    normalized_row = {
+                        (k or '').strip().lower().replace(' ', '_'): v
+                        for k, v in row.items()
+                    }
+
                     # Safely get values with None check
-                    item_code_raw = row.get('item_code')
-                    qty_str_raw = row.get('qty')  # New count from recon
-                    current_qty_raw = row.get('current_qty')  # What system knows
-                    item_name_raw = row.get('item_name')  # Product name
+                    item_code_raw = normalized_row.get('item_code')
+                    qty_str_raw = normalized_row.get('qty') or normalized_row.get('quantity')  # New count from recon
+                    current_qty_raw = normalized_row.get('current_qty')
+                    item_name_raw = normalized_row.get('item_name')
+                    valuation_rate_raw = normalized_row.get('valuation_rate')
                     
                     if item_code_raw is None or qty_str_raw is None:
                         continue
@@ -241,6 +312,7 @@ class LabelPrinter:
                     try:
                         qty = int(float(qty_str))  # Reconciled quantity
                         current_qty = 0
+                        valuation_rate = ''
                         
                         # Try to get current qty
                         if current_qty_raw and current_qty_raw.strip():
@@ -248,13 +320,17 @@ class LabelPrinter:
                                 current_qty = int(float(current_qty_raw.strip()))
                             except (ValueError, TypeError):
                                 current_qty = 0
+
+                        if valuation_rate_raw and str(valuation_rate_raw).strip():
+                            valuation_rate = str(valuation_rate_raw).strip()
                         
                         if qty > 0:
                             self.stock_data.append({
                                 'item_code': item_code,
                                 'item_name': item_name,  # Store item name
                                 'quantity': qty,  # Reconciled count
-                                'current_qty': current_qty  # System count
+                                'current_qty': current_qty,  # System count
+                                'valuation_rate': valuation_rate  # Price source for labels
                             })
                     except (ValueError, TypeError):
                         continue
@@ -267,15 +343,20 @@ class LabelPrinter:
             traceback.print_exc()
             return False
     
-    def generate_label_tspl(self, item_code: str, quantity: int, current: int, is_last: bool = False, item_name: str = '') -> str:
-        """Generate TSPL command for label - clean redesigned format"""
+    def generate_label_tspl(self, item_code: str, quantity: int, current: int, is_last: bool = False, item_name: str = '', price_override: Optional[str] = None) -> str:
+        """Generate TSPL command for a product label.
+
+        Note: The script previously supported a special end-of-batch "stock count" label
+        (is_last=True). That behavior has been removed from the printing flows; this
+        parameter is kept for backward compatibility with existing call sites.
+        """
         item_info = self.items_data.get(item_code, {})
         
         # Get product details
         barcode = item_info.get('barcode', item_code)
         # Use item_name from stock_recon if provided, otherwise fall back to name from items
         display_name = item_name if item_name else item_info.get('name', 'Product')
-        price = item_info.get('rate', '0')
+        price = price_override if (price_override is not None and str(price_override).strip() != '') else item_info.get('rate', '0')
         colour = item_info.get('colour', 'N/A')
         size = item_info.get('size', 'N/A')
         
@@ -307,20 +388,73 @@ class LabelPrinter:
         else:
             line1 = product_desc
         
-        # Standard label or summary label
-        if not is_last:
-            # Clean label layout: Product name, Bar, Price, Size (left), Colour (left), Barcode, Item code (centered)
-            
-            if line2:
-                tspl = f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nCLS\\nTEXT 8,16,\\"2\\",0,1,1,\\"{line1}\\"\\nTEXT 8,36,\\"2\\",0,1,1,\\"{line2}\\"\\nBAR 8,56,304,2\\nTEXT 8,66,\\"4\\",0,1,1,\\"{price_display}\\"\\nTEXT 8,95,\\"2\\",0,1,1,\\"Size: {size}\\"\\nTEXT 8,113,\\"2\\",0,1,1,\\"{colour}\\"\\nBARCODE 0,135,\\"39\\",65,0,0,1,1,\\"{barcode}\\"\\nTEXT 100,210,\\"1\\",0,1,1,\\"{item_code}\\"\\nPRINT 1\\n'
-            else:
-                tspl = f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nCLS\\nTEXT 8,16,\\"2\\",0,1,1,\\"{line1}\\"\\nBAR 8,56,304,2\\nTEXT 8,66,\\"4\\",0,1,1,\\"{price_display}\\"\\nTEXT 8,95,\\"2\\",0,1,1,\\"Size: {size}\\"\\nTEXT 8,113,\\"2\\",0,1,1,\\"{colour}\\"\\nBARCODE 0,135,\\"39\\",65,0,0,1,1,\\"{barcode}\\"\\nTEXT 100,210,\\"1\\",0,1,1,\\"{item_code}\\"\\nPRINT 1\\n'
+        # Product label layout: Product name, Bar, Price, Size (left), Colour (left), Barcode, Item code
+        # Each label includes SIZE/GAP to reset any drift
+        # Barcode: left aligned with margin (user preference), not centered.
+        barcode_x = max(0, int(self.barcode_x_dots))
+        item_code_x = self._center_x_for_text(str(item_code), font='1', xmul=1)
+
+        safe_line1 = self._tspl_escape(line1)
+        safe_line2 = self._tspl_escape(line2)
+        safe_price = self._tspl_escape(price_display)
+        safe_size = self._tspl_escape(size)
+        safe_colour = self._tspl_escape(colour)
+        safe_barcode = self._tspl_escape(str(barcode))
+        safe_item_code = self._tspl_escape(str(item_code))
+
+        if line2:
+            tspl = (
+                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0,0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
+                f'TEXT 20,16,\\"2\\",0,1,1,\\"{safe_line1}\\"\\n'
+                f'TEXT 20,36,\\"2\\",0,1,1,\\"{safe_line2}\\"\\n'
+                f'BAR 20,56,280,2\\n'
+                f'TEXT 20,66,\\"4\\",0,1,1,\\"{safe_price}\\"\\n'
+                f'TEXT 20,95,\\"2\\",0,1,1,\\"Size: {safe_size}\\"\\n'
+                f'TEXT 20,113,\\"2\\",0,1,1,\\"{safe_colour}\\"\\n'
+                f'BARCODE {barcode_x},135,\\"39\\",70,0,0,1,2,\\"{safe_barcode}\\"\\n'
+                f'TEXT {item_code_x},210,\\"1\\",0,1,1,\\"{safe_item_code}\\"\\n'
+                f'PRINT 1\\n'
+            )
         else:
-            # Summary/Stock Count label - printed at end of each product batch
-            # Simplified: Just header, item code, printed qty, and large box for actual count
-            tspl = f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nCLS\\nTEXT 8,10,\\"3\\",0,1,1,\\"STOCK COUNT\\"\\nBAR 8,35,304,2\\nTEXT 8,45,\\"2\\",0,1,1,\\"Item: {item_code}\\"\\nTEXT 8,65,\\"2\\",0,1,1,\\"Printed: {quantity} labels\\"\\nBOX 8,90,304,200,2\\nTEXT 15,100,\\"2\\",0,1,1,\\"Actual Count:\\"\\nTEXT 15,130,\\"4\\",0,1,1,\\"_______________\\"\\nPRINT 1\\n'
+            tspl = (
+                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0,0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
+                f'TEXT 20,16,\\"2\\",0,1,1,\\"{safe_line1}\\"\\n'
+                f'BAR 20,56,280,2\\n'
+                f'TEXT 20,66,\\"4\\",0,1,1,\\"{safe_price}\\"\\n'
+                f'TEXT 20,95,\\"2\\",0,1,1,\\"Size: {safe_size}\\"\\n'
+                f'TEXT 20,113,\\"2\\",0,1,1,\\"{safe_colour}\\"\\n'
+                f'BARCODE {barcode_x},135,\\"39\\",70,0,0,1,2,\\"{safe_barcode}\\"\\n'
+                f'TEXT {item_code_x},210,\\"1\\",0,1,1,\\"{safe_item_code}\\"\\n'
+                f'PRINT 1\\n'
+            )
         
         return tspl
+    
+    def calibrate_printer(self) -> bool:
+        """Calibrate the printer to detect label gaps and edges"""
+        try:
+            # Full printer initialization sequence to reset all settings
+            # This ensures consistent behavior across power cycles
+            init_commands = [
+                '~!T',  # Reset printer to defaults
+                'SIZE 40 mm,30 mm',
+                'GAP 2 mm,0',
+                'DIRECTION 0,0',  # Set to normal direction
+                f'SHIFT {self.horizontal_shift_dots}',
+                'OFFSET 0',  # No vertical offset
+                'SPEED 4',  # Set print speed
+                'DENSITY 8',  # Set darkness
+                'SET TEAR ON',  # Enable tear-off mode
+                'CLS'  # Clear buffer
+            ]
+            calibration_cmd = '\n'.join(init_commands) + '\n'
+            cmd = f'echo -e "{calibration_cmd}" | sudo tee {self.selected_printer} > /dev/null'
+            subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            time.sleep(0.5)  # Give printer time to process
+            return True
+        except Exception as e:
+            print(f"❌ Calibration error: {e}")
+            return False
     
     def send_to_printer(self, tspl_command: str) -> bool:
         """Send TSPL command to the selected printer using echo -e"""
@@ -342,22 +476,28 @@ class LabelPrinter:
         print(f"  Printing batch: Labels {start_idx + 1} to {end_idx}")
         print(f"{'='*60}")
         
+        # Calibrate printer before starting batch
+        if start_idx == 0:
+            print("📐 Calibrating printer...")
+            self.calibrate_printer()
+        
         labels_printed = 0
         
         for item_code, qty_needed, current_label, is_last in batch:
             # Get item_name from stock_data
             item_name = ''
+            valuation_rate = ''
             for stock_item in self.stock_data:
                 if stock_item['item_code'] == item_code:
                     item_name = stock_item.get('item_name', '')
+                    valuation_rate = stock_item.get('valuation_rate', '')
                     break
             
-            tspl = self.generate_label_tspl(item_code, qty_needed, current_label, is_last, item_name)
+            tspl = self.generate_label_tspl(item_code, qty_needed, current_label, is_last, item_name, price_override=valuation_rate)
             
             if self.send_to_printer(tspl):
                 labels_printed += 1
-                status = "📋 SUMMARY" if is_last else "✓"
-                print(f"{status} Label {start_idx + labels_printed}/{len(items_to_print)}: {item_code} ({current_label}/{qty_needed})")
+                print(f"✓ Label {start_idx + labels_printed}/{len(items_to_print)}: {item_code} ({current_label}/{qty_needed})")
             else:
                 print(f"❌ Failed to print label for {item_code}")
                 
@@ -397,9 +537,6 @@ class LabelPrinter:
             # Add regular labels
             for i in range(1, labels_needed + 1):
                 items_to_print.append((item_code, labels_needed, i, False))
-            
-            # Add summary label as the last one
-            items_to_print.append((item_code, labels_needed, labels_needed, True))
         
         total_labels = len(items_to_print)
         print(f"\n{'='*60}")
@@ -483,7 +620,8 @@ class LabelPrinter:
         input("\nPress ENTER to print 1 test label...")
         
         item_name = stock_item.get('item_name', '')
-        tspl = self.generate_label_tspl(item_code, quantity, 1, False, item_name)
+        valuation_rate = stock_item.get('valuation_rate', '')
+        tspl = self.generate_label_tspl(item_code, quantity, 1, False, item_name, price_override=valuation_rate)
         
         if self.send_to_printer(tspl):
             print(f"\n✓ Test label printed for {item_code}")
@@ -492,7 +630,7 @@ class LabelPrinter:
             print(f"\n❌ Failed to print test label")
     
     def print_test_batch(self):
-        """Print a small batch (product labels + stock count label) for testing"""
+        """Print a small batch of product labels for testing"""
         if not self.stock_data:
             print("❌ No stock data loaded")
             return
@@ -527,32 +665,25 @@ class LabelPrinter:
         print(f"  Colour: {item_info.get('colour', 'N/A')}")
         print(f"  Size: {item_info.get('size', 'N/A')}")
         print(f"  Price: {item_info.get('rate', 'N/A')}")
-        print(f"  Labels to print: {quantity} + 1 stock count label")
+        print(f"  Labels to print: {quantity}")
         print(f"{'='*60}")
         
-        input(f"\nPress ENTER to print {quantity + 1} test labels...")
+        input(f"\nPress ENTER to print {quantity} test labels...")
         
         # Print regular product labels
         item_name = stock_item.get('item_name', '')
+        valuation_rate = stock_item.get('valuation_rate', '')
         for i in range(1, quantity + 1):
-            tspl = self.generate_label_tspl(item_code, quantity, i, False, item_name)
+            tspl = self.generate_label_tspl(item_code, quantity, i, False, item_name, price_override=valuation_rate)
             if self.send_to_printer(tspl):
                 print(f"✓ Label {i}/{quantity}: {item_code}")
             else:
                 print(f"❌ Failed: Label {i}")
-        
-        # Print stock count label
-        tspl = self.generate_label_tspl(item_code, quantity, quantity, True, item_name)
-        if self.send_to_printer(tspl):
-            print(f"📋 Stock count label printed")
-        else:
-            print(f"❌ Failed: Stock count label")
-        
-        print(f"\n✓ Test batch complete: {quantity} product labels + 1 stock count label")
+
+        print(f"\n✓ Test batch complete: {quantity} product labels")
         print(f"\nPlease verify:")
         print(f"  1. Product labels show correct info")
-        print(f"  2. Stock count label appears at the end")
-        print(f"  3. All barcodes scan correctly")
+        print(f"  2. All barcodes scan correctly")
     
     def print_sample(self, num_labels: int = 25):
         """Print a sample batch for testing"""
@@ -585,10 +716,7 @@ class LabelPrinter:
                 items_to_print.append((item_code, quantity, i, False))
                 label_count += 1
             
-            # Add summary label if we still have room
-            if label_count < num_labels and quantity > 0:
-                items_to_print.append((item_code, quantity, quantity, True))
-                label_count += 1
+            # Note: summary/stock-count labels removed; sample prints product labels only
         
         input(f"\nPress ENTER to print {len(items_to_print)} sample labels...")
         
@@ -596,16 +724,17 @@ class LabelPrinter:
         for idx, (item_code, qty, current, is_last) in enumerate(items_to_print, 1):
             # Get item_name from stock_data
             item_name = ''
+            valuation_rate = ''
             for stock_item in self.stock_data:
                 if stock_item['item_code'] == item_code:
                     item_name = stock_item.get('item_name', '')
+                    valuation_rate = stock_item.get('valuation_rate', '')
                     break
             
-            tspl = self.generate_label_tspl(item_code, qty, current, is_last, item_name)
+            tspl = self.generate_label_tspl(item_code, qty, current, is_last, item_name, price_override=valuation_rate)
             
             if self.send_to_printer(tspl):
-                status = "📋 SUMMARY" if is_last else "✓"
-                print(f"{status} Sample {idx}/{len(items_to_print)}: {item_code} ({current}/{qty})")
+                print(f"✓ Sample {idx}/{len(items_to_print)}: {item_code} ({current}/{qty})")
             else:
                 print(f"❌ Failed: {item_code}")
         
@@ -638,19 +767,20 @@ class LabelPrinter:
             print("  MAIN MENU")
             print("="*60)
             print("  1. Print SINGLE test label")
-            print("  2. Print TEST BATCH (5 labels + stock count)")
+            print("  2. Print TEST BATCH (5 labels)")
             print("  3. Print SAMPLE (25 labels)")
             print("  4. Print ALL - FRESH mode (all labels)")
             print("  5. Print ALL - RECON mode (difference only)")
             print("  6. View statistics")
-            print("  7. Change printer")
-            print("  8. Exit")
+            print("  7. Calibrate printer (fix alignment)")
+            print("  8. Change printer")
+            print("  9. Exit")
             print("="*60)
             print("\n  FRESH: Prints all stock labels")
             print("  RECON: Prints only difference (QTY - Current QTY)")
             print("="*60)
             
-            choice = input("\nSelect option (1-8): ").strip()
+            choice = input("\nSelect option (1-9): ").strip()
             
             if choice == '1':
                 self.print_single_test()
@@ -665,13 +795,19 @@ class LabelPrinter:
             elif choice == '6':
                 self.show_statistics()
             elif choice == '7':
+                print("\n📐 Calibrating printer...")
+                if self.calibrate_printer():
+                    print("✓ Calibration complete. Try printing a test label.")
+                else:
+                    print("❌ Calibration failed.")
+            elif choice == '8':
                 if not self.select_printer():
                     print("❌ Printer selection cancelled.")
-            elif choice == '8':
+            elif choice == '9':
                 print("\n👋 Thank you for using the Label Printing System!")
                 break
             else:
-                print("❌ Invalid choice. Please enter 1-8.")
+                print("❌ Invalid choice. Please enter 1-9.")
     
     def show_statistics(self):
         """Show statistics about the current data"""
@@ -680,14 +816,13 @@ class LabelPrinter:
         print("="*60)
         
         total_products = len(self.stock_data)
-        total_labels = sum(item['quantity'] + 1 for item in self.stock_data)  # +1 for summary label
+        total_labels = sum(item['quantity'] for item in self.stock_data)
         total_stock = sum(item['quantity'] for item in self.stock_data)
         
         print(f"  Products with stock: {total_products}")
         print(f"  Total units in stock: {total_stock}")
         print(f"  Total labels to print: {total_labels}")
         print(f"    - Product labels: {total_stock}")
-        print(f"    - Summary labels: {total_products}")
         print("="*60)
         
         # Show top 10 items by quantity

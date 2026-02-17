@@ -1,0 +1,12 @@
+# Bayt Al Emirati Label Printer - Desktop App Requirements
+# For Debian 13 Trixie
+
+# GUI Framework
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# HTTP Client
+requests>=2.31.0
+
+# Optional: For better error handling
+certifi>=2023.0.0

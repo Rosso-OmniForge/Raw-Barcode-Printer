@@ -6,9 +6,9 @@
 
 set -e
 
-echo "================================================"
-echo "  Bayt Al Emirati Label Printer Installation"
-echo "================================================"
+echo "======================================================"
+echo "  Bayt Al Emirati Automated Label Printer Installation"
+echo "======================================================"
 echo ""
 
 # Check if running on Debian
@@ -52,11 +52,36 @@ pip install -r requirements_app.txt
 
 # Make app executable
 chmod +x bayt_printer_app.py
+chmod +x launch_printer.sh
+
+# Configure desktop-session autostart
+echo ""
+echo "Configuring autostart on login..."
+AUTOSTART_DIR="$HOME/.config/autostart"
+AUTOSTART_FILE="$AUTOSTART_DIR/bayt-printer.desktop"
+mkdir -p "$AUTOSTART_DIR"
+
+cat > "$AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Bayt Al Emirati Printer
+Comment=Start Bayt label printer app on login
+Exec=$PWD/launch_printer.sh
+Path=$PWD
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Categories=Utility;
+EOF
+
+chmod 644 "$AUTOSTART_FILE"
 
 echo ""
 echo "================================================"
 echo "  Installation Complete!"
 echo "================================================"
+echo ""
+echo "Autostart configured: $AUTOSTART_FILE"
+echo "App will launch automatically at desktop login."
 echo ""
 echo "To run the application:"
 echo "  1. Activate virtual environment: source venv/bin/activate"

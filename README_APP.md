@@ -9,6 +9,7 @@ A modern, branded desktop application for printing product labels directly from 
 - 🖨️ **Auto-Discovery**: Automatically scans for USB label printers
 - 🎯 **Calibration**: Built-in printer calibration with test labels
 - 🔄 **Auto-Sync**: Automatically fetches print requests from the server every 30 seconds
+- 🚀 **Auto-Start + Auto-Connect**: Starts at login and reconnects to saved API URL
 - ✅ **Modern UI**: Clean, branded PyQt6 interface
 - 🔒 **Secure**: API key authentication
 - 📊 **Real-time Progress**: Live printing progress with status updates
@@ -35,6 +36,7 @@ This will:
 2. Create a Python virtual environment
 3. Install all required Python packages
 4. Make the application executable
+5. Create desktop autostart entry (`~/.config/autostart/bayt-printer.desktop`)
 
 ### Running the Application
 
@@ -51,9 +53,25 @@ source venv/bin/activate
 python3 bayt_printer_app.py
 ```
 
+### Startup on Boot (Desktop Login)
+
+The installer creates this autostart file:
+
+```bash
+~/.config/autostart/bayt-printer.desktop
+```
+
+To disable autostart:
+
+```bash
+rm ~/.config/autostart/bayt-printer.desktop
+```
+
 ### Configuration
 
 1. **API Server URL**: Enter the backend server URL (default: `http://localhost:8000`)
+   - URL is saved automatically and restored on next launch
+   - App attempts automatic API connection on startup
 2. **API Key**: Configured in the application (default: `BAE-PRINTER-2026-SECURE-KEY`)
    - For production, update the API key in both:
      - `bayt_printer_app.py` (line ~21)

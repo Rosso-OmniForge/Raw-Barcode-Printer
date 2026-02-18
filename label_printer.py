@@ -743,7 +743,7 @@ class LabelPrinter:
     def run(self):
         """Main application loop"""
         print("\n" + "="*60)
-        print("  BAYT AL EMIRATI - Label Printing System")
+        print("  BAYT AL EMIRATI - Print Manager")
         print("  Ultra High-End Clothing Store")
         print("="*60)
         
@@ -804,7 +804,7 @@ class LabelPrinter:
                 if not self.select_printer():
                     print("❌ Printer selection cancelled.")
             elif choice == '9':
-                print("\n👋 Thank you for using the Label Printing System!")
+                print("\n👋 Thank you for using the Print Manager!")
                 break
             else:
                 print("❌ Invalid choice. Please enter 1-9.")

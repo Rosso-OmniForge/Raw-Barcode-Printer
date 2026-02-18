@@ -1,8 +1,8 @@
-# Label Printing System - Complete Implementation Guide
+# Print Manager - Complete Implementation Guide
 
 ## Overview
 
-This document describes the complete label printing system for Bayt Al Emirati, including auto-generation from procurement, manual print requests, and the desktop printing application.
+This document describes the complete Print Manager for Bayt Al Emirati, including auto-generation from procurement, manual print requests, and the desktop printing application.
 
 ---
 

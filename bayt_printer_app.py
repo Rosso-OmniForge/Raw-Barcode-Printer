@@ -6,6 +6,7 @@ Modern PyQt6 GUI for managing and printing label requests
 
 import sys
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -17,10 +18,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QMessageBox, QFrame,
     QProgressBar, QTextEdit, QLineEdit, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea
+    QScrollArea, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
+from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush
 
 import requests
 
@@ -29,6 +30,162 @@ import requests
 API_BASE_URL = "https://store.baytalemirati.co.za"  # Change to production URL
 API_KEY = "BAE-PRINTER-2026-SECURE-KEY"  # Should match backend
 APP_CONFIG_FILE = Path.home() / ".config" / "bayt_printer" / "settings.json"
+APP_HISTORY_FILE = Path.home() / ".config" / "bayt_printer" / "print_history.json"
+
+
+# ── Code 39 encoding table ──────────────────────────────────────────────────
+# Each character → 9-char string of '0'(narrow) / '1'(wide)
+# Bit positions: bar, space, bar, space, bar, space, bar, space, bar
+_CODE39_TABLE: Dict[str, str] = {
+    '0': '000110100', '1': '100100001', '2': '001100001', '3': '101100000',
+    '4': '000110001', '5': '100110000', '6': '001110000', '7': '000100101',
+    '8': '100100100', '9': '001100100', 'A': '100001001', 'B': '001001001',
+    'C': '101001000', 'D': '000011001', 'E': '100011000', 'F': '001011000',
+    'G': '000001101', 'H': '100001100', 'I': '001001100', 'J': '000011100',
+    'K': '100000011', 'L': '001000011', 'M': '101000010', 'N': '000010011',
+    'O': '100010010', 'P': '001010010', 'Q': '000000111', 'R': '100000110',
+    'S': '001000110', 'T': '000010110', 'U': '110000001', 'V': '011000001',
+    'W': '111000000', 'X': '010010001', 'Y': '110010000', 'Z': '011010000',
+    '-': '010000101', '.': '110000100', ' ': '011000100', '$': '010101000',
+    '/': '010100010', '+': '010001010', '%': '000101010', '*': '010010100',
+}
+
+
+class TSPLRenderer:
+    """
+    Parses a TSPL command string and renders it to a QPixmap using QPainter.
+    Supports: CLS, TEXT, BAR, BARCODE (Code 39 / 3of9), BOX commands.
+    """
+
+    SCALE: float = 2.5     # dots → screen pixels
+    DOT_W: int   = 320     # label width  (40 mm @ 203 dpi)
+    DOT_H: int   = 240     # label height (30 mm @ 203 dpi)
+
+    # TSPL built-in font → (char_width_dots, char_height_dots)
+    _FONT_DIMS: Dict[str, tuple] = {
+        '1': (8,  10),
+        '2': (12, 20),
+        '3': (16, 24),
+        '4': (24, 32),
+        '5': (32, 48),
+    }
+
+    # ------------------------------------------------------------------ #
+    def render(self, tspl: str) -> QPixmap:
+        """Return a QPixmap with the label rendered at SCALE×."""
+        px_w = int(self.DOT_W * self.SCALE)
+        px_h = int(self.DOT_H * self.SCALE)
+
+        pixmap = QPixmap(px_w, px_h)
+        pixmap.fill(Qt.GlobalColor.white)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        # Label border
+        border_pen = QPen(QColor('#888888'))
+        border_pen.setWidth(2)
+        painter.setPen(border_pen)
+        painter.drawRect(1, 1, px_w - 2, px_h - 2)
+
+        for raw_line in tspl.splitlines():
+            self._dispatch(painter, raw_line.strip())
+
+        painter.end()
+        return pixmap
+
+    # ------------------------------------------------------------------ #
+    def _s(self, dots: int) -> int:
+        """Scale dots → integer pixels."""
+        return int(dots * self.SCALE)
+
+    # ------------------------------------------------------------------ #
+    def _dispatch(self, painter: QPainter, line: str) -> None:
+        # TEXT  x,y,"font",rotation,xmul,ymul,"data"
+        m = re.match(r'TEXT\s+(\d+),(\d+),"(\w+)",(\d+),(\d+),(\d+),"(.*)"', line)
+        if m:
+            x, y   = int(m.group(1)), int(m.group(2))
+            font   = m.group(3)
+            xm, ym = int(m.group(5)), int(m.group(6))
+            text   = m.group(7).replace('\\"', '"').replace('\\\\', '\\')
+            self._draw_text(painter, x, y, font, xm, ym, text)
+            return
+
+        # BAR  x,y,width,height
+        m = re.match(r'BAR\s+(\d+),(\d+),(\d+),(\d+)', line)
+        if m:
+            x, y = self._s(int(m.group(1))), self._s(int(m.group(2)))
+            w, h = max(1, self._s(int(m.group(3)))), max(1, self._s(int(m.group(4))))
+            painter.fillRect(x, y, w, h, QColor('black'))
+            return
+
+        # BARCODE  x,y,"type",height,human,rotation,narrow,wide,"data"
+        m = re.match(
+            r'BARCODE\s+(\d+),(\d+),"(\w+)",(\d+),(\d+),(\d+),(\d+),(\d+),"(.*)"', line
+        )
+        if m:
+            x, y   = int(m.group(1)), int(m.group(2))
+            btype  = m.group(3)
+            height = int(m.group(4))
+            narrow = int(m.group(7))
+            wide   = int(m.group(8))
+            data   = m.group(9).replace('\\"', '"').replace('\\\\', '\\')
+            if '39' in btype or '3OF9' in btype.upper():
+                self._draw_code39(painter, x, y, height, narrow, wide, data)
+            return
+
+        # BOX  x1,y1,x2,y2,thickness
+        m = re.match(r'BOX\s+(\d+),(\d+),(\d+),(\d+),(\d+)', line)
+        if m:
+            x1, y1 = self._s(int(m.group(1))), self._s(int(m.group(2)))
+            x2, y2 = self._s(int(m.group(3))), self._s(int(m.group(4)))
+            t      = max(1, self._s(int(m.group(5))))
+            box_pen = QPen(QColor('black'))
+            box_pen.setWidth(t)
+            painter.setPen(box_pen)
+            painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+
+    # ------------------------------------------------------------------ #
+    def _draw_text(self, painter: QPainter, x: int, y: int,
+                   font: str, xmul: int, ymul: int, text: str) -> None:
+        dims    = self._FONT_DIMS.get(font, (8, 10))
+        char_h  = dims[1] * max(1, ymul)        # height in dots
+        pt_size = max(4, int(char_h * self.SCALE * 0.70))
+        qfont   = QFont("Liberation Mono", pt_size)
+        qfont.setBold(font in ('3', '4', '5'))
+        painter.setFont(qfont)
+        pen = QPen(QColor('black'))
+        painter.setPen(pen)
+        # baseline = top-left y + ascent
+        painter.drawText(self._s(x), self._s(y) + pt_size, text)
+
+    # ------------------------------------------------------------------ #
+    def _draw_code39(self, painter: QPainter, x: int, y: int,
+                     height: int, narrow: int, wide: int, data: str) -> None:
+        """Render a Code 39 barcode from its raw data string."""
+        full = '*' + data.upper().strip('*') + '*'
+        cur_x = x
+        no_pen = QPen(Qt.PenStyle.NoPen)
+        painter.setPen(no_pen)
+
+        for ch in full:
+            pattern = _CODE39_TABLE.get(ch)
+            if pattern is None:
+                # Unknown char — skip with estimated width
+                cur_x += narrow * 5 + wide * 4
+                continue
+            for i, elem in enumerate(pattern):
+                w_dots  = wide if elem == '1' else narrow
+                is_bar  = (i % 2 == 0)           # even indices = bars
+                if is_bar:
+                    painter.fillRect(
+                        self._s(cur_x), self._s(y),
+                        max(1, self._s(w_dots)), self._s(height),
+                        QColor('black')
+                    )
+                cur_x += w_dots
+            # Inter-character gap = 1 narrow module
+            cur_x += narrow
 
 
 class PrinterScanner(QThread):
@@ -121,24 +278,27 @@ class PrintJob(QThread):
         
         # Title (top)
         title_x = self._center_x_for_text(title, "3")
-        tspl.append(f'TEXT {title_x},10,"3",0,1,1,"{self._tspl_escape(title)}"')
-        
+        tspl.append(f'TEXT {title_x},5,"3",0,1,1,"{self._tspl_escape(title)}"')
+
         # Variant label (below title)
         if variant_label:
             variant_x = self._center_x_for_text(variant_label, "2")
-            tspl.append(f'TEXT {variant_x},40,"2",0,1,1,"{self._tspl_escape(variant_label)}"')
-        
-        # Code39 barcode (center)
-        bc_x = self._center_x_for_code39(code39, narrow=2, wide=4)
-        tspl.append(f'BARCODE {bc_x},70,"39",60,1,0,2,4,"{self._tspl_escape(code39)}"')
-        
-        # Price (bottom)
-        price_x = self._center_x_for_text(price, "4", xmul=2)
-        tspl.append(f'TEXT {price_x},150,"4",0,2,2,"{self._tspl_escape(price)}"')
-        
-        # SKU (very bottom, small)
+            tspl.append(f'TEXT {variant_x},27,"2",0,1,1,"{self._tspl_escape(variant_label)}"')
+
+        # Separator bar
+        tspl.append("BAR 20,44,280,2")
+
+        # Price (above barcode, font 3 scale 1×1 — matches proven working sample)
+        price_x = self._center_x_for_text(price, "3")
+        tspl.append(f'TEXT {price_x},50,"3",0,1,1,"{self._tspl_escape(price)}"')
+
+        # Code39 barcode — narrow=1 wide=2 is the only setting that fits on a 40 mm label
+        bc_x = self._center_x_for_code39(code39, narrow=1, wide=2)
+        tspl.append(f'BARCODE {bc_x},78,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
+
+        # SKU (very bottom, small font)
         sku_x = self._center_x_for_text(sku, "1")
-        tspl.append(f'TEXT {sku_x},210,"1",0,1,1,"{self._tspl_escape(sku)}"')
+        tspl.append(f'TEXT {sku_x},215,"1",0,1,1,"{self._tspl_escape(sku)}"')
         
         tspl.append("PRINT 1")
         
@@ -192,6 +352,8 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         self.auto_connect_on_startup = True
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
+        self._selected_request: Optional[Dict[str, Any]] = None   # tracks table selection
+        self._current_print_request: Optional[Dict[str, Any]] = None  # for history
 
         self.load_settings()
         
@@ -504,10 +666,16 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         calibrate_btn.setStyleSheet(self._btn_primary())
         calibrate_btn.clicked.connect(self.calibrate_printer)
 
+        test_label_btn = QPushButton("Print Test Label")
+        test_label_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_label_btn.setStyleSheet(self._btn_secondary())
+        test_label_btn.clicked.connect(self.print_test_label_standalone)
+
         pc_layout.addWidget(self.printer_combo)
         pc_layout.addWidget(self.calibration_status)
         pc_layout.addWidget(scan_btn)
         pc_layout.addWidget(calibrate_btn)
+        pc_layout.addWidget(test_label_btn)
         config_layout.addWidget(printer_card)
 
         # ── Connection card ─────────────────────────────
@@ -544,6 +712,30 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         cc_layout.addWidget(self.api_url_input)
         cc_layout.addWidget(connect_btn)
         config_layout.addWidget(conn_card)
+
+        # ── Update / version card ────────────────────────────────
+        config_layout.addWidget(self._section_heading("APP"))
+
+        update_card = QWidget()
+        update_card.setStyleSheet(self._card_style(8))
+        uc_layout = QVBoxLayout(update_card)
+        uc_layout.setContentsMargins(12, 12, 12, 12)
+        uc_layout.setSpacing(8)
+
+        self.version_label = QLabel(self._current_version())
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.version_label.setStyleSheet(
+            f"color:{self.C_TEXT_DIM}; font-size:10px; background:transparent; border:none;"
+        )
+
+        update_btn = QPushButton("\u21ea  Update App")
+        update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        update_btn.setStyleSheet(self._btn_primary())
+        update_btn.clicked.connect(self._do_update)
+
+        uc_layout.addWidget(self.version_label)
+        uc_layout.addWidget(update_btn)
+        config_layout.addWidget(update_card)
 
         config_layout.addStretch()
         config_scroll.setWidget(config_inner)
@@ -631,6 +823,27 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         refresh_btn.clicked.connect(self.fetch_pending_requests)
         bar_layout.addWidget(refresh_btn)
 
+        preview_btn = QPushButton("Preview TSPL")
+        preview_btn.setFixedHeight(36)
+        preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        preview_btn.setStyleSheet(self._btn_secondary())
+        preview_btn.clicked.connect(self.show_tspl_preview)
+        bar_layout.addWidget(preview_btn)
+
+        visual_btn = QPushButton("⬜ Visual Preview")
+        visual_btn.setFixedHeight(36)
+        visual_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        visual_btn.setStyleSheet(self._btn_primary())
+        visual_btn.clicked.connect(self.show_visual_preview)
+        bar_layout.addWidget(visual_btn)
+
+        history_btn = QPushButton("History / Reprint")
+        history_btn.setFixedHeight(36)
+        history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        history_btn.setStyleSheet(self._btn_secondary())
+        history_btn.clicked.connect(self.show_print_history)
+        bar_layout.addWidget(history_btn)
+
         return bar
     
     # (create_header removed — replaced by _build_sidebar / _build_top_bar)
@@ -669,6 +882,7 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         self.requests_table.setAlternatingRowColors(False)
         self.requests_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.requests_table.verticalHeader().setDefaultSectionSize(46)
+        self.requests_table.itemSelectionChanged.connect(self._on_request_selection_changed)
         self.requests_table.setStyleSheet(f"""
             QTableWidget {{
                 background:{self.C_SURFACE};
@@ -817,19 +1031,36 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
             return
         
         try:
-            # Send calibration command
-            calibration_tspl = "SIZE 40 mm, 30 mm\nGAP 2 mm, 0 mm\n"
-            
+            # Send full calibration sequence:
+            # 1. Set label dimensions and gap
+            # 2. GAPDETECT  — tells the printer to physically feed and measure the gap
+            # 3. HOME       — advances to the first clean label start position
+            # Without GAPDETECT the printer never actually runs its gap sensor, so
+            # "Calibrate" appeared to do nothing.
+            calibration_tspl = (
+                "SIZE 40 mm,30 mm\n"
+                "GAP 2 mm,0\n"
+                "DIRECTION 0\n"
+                "REFERENCE 0,0\n"
+                "SET TEAR ON\n"
+                "SPEED 4\n"
+                "DENSITY 8\n"
+                "GAPDETECT\n"   # <-- the actual calibration trigger
+                "HOME\n"        # <-- advance to first clean label start
+            )
             with open(self.selected_printer, 'wb') as printer:
                 printer.write(calibration_tspl.encode('utf-8'))
-            
-            # Print test label
+
+            # Give the printer time to run the gap-detection feed (~1.5 s typical)
+            time.sleep(1.5)
+
+            # Print test label using real-looking data
             test_item = {
-                "title": "TEST LABEL",
+                "title": "BAYT AL EMIRATI",
                 "variant_label": "Calibration Test",
-                "sku": "TEST-001",
-                "code39": "TEST001",
-                "price_cents": 9999,
+                "sku": "CALIB-TEST",
+                "code39": "CALIBTEST",
+                "price_cents": 95000,
                 "currency": "ZAR"
             }
             
@@ -1021,10 +1252,13 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
                 QMessageBox.warning(self, "No Items", "This request has no items to print.")
                 return
             
+            # Track for history saving
+            self._current_print_request = request
+
             # Start print job
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
-            
+
             self.print_job = PrintJob(self.selected_printer, items)
             self.print_job.progress.connect(self.on_print_progress)
             self.print_job.finished.connect(lambda s, m: self.on_print_finished(s, m, request['id']))
@@ -1059,6 +1293,7 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
                 )
                 
                 if response.status_code == 200:
+                    self._save_to_history(self._current_print_request)
                     QMessageBox.information(self, "Success", message)
                     self.fetch_pending_requests()  # Refresh list
                 else:
@@ -1077,6 +1312,789 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
             QMessageBox.critical(self, "Print Failed", message)
         
         self.status_bar.showMessage("Ready")
+
+    # ─────────────────────────────────────────────────────────────
+    # Selection tracking
+    # ─────────────────────────────────────────────────────────────
+    def _on_request_selection_changed(self):
+        """Track the currently selected row so Preview TSPL knows which request to show."""
+        row = self.requests_table.currentRow()
+        if 0 <= row < len(self.pending_requests):
+            self._selected_request = self.pending_requests[row]
+            self.show_request_details(self._selected_request)
+        else:
+            self._selected_request = None
+
+    # ─────────────────────────────────────────────────────────────
+    # TSPL Visualizer
+    # ─────────────────────────────────────────────────────────────
+    def show_tspl_preview(self):
+        """Open a dialog showing the raw TSPL commands for the selected print request."""
+        request = self._selected_request
+        if not request:
+            if self.pending_requests:
+                request = self.pending_requests[0]
+            else:
+                QMessageBox.information(self, "No Request Selected",
+                    "Select a request from the queue first, or refresh to load requests.")
+                return
+
+        try:
+            headers = {"X-API-Key": self.api_key}
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                headers=headers, timeout=10
+            )
+            if response.status_code != 200:
+                QMessageBox.warning(self, "Cannot Load", f"Server returned {response.status_code}.")
+                return
+            items = response.json().get("items", [])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to fetch items: {e}")
+            return
+
+        if not items:
+            QMessageBox.information(self, "No Items", "This request has no items.")
+            return
+
+        # Build a temporary PrintJob just to use _generate_label_tspl
+        preview_job = PrintJob("", items)
+        lines = []
+        lines.append(f"=== TSPL PREVIEW: Request #{request['id']} ===")
+        lines.append(f"Total items: {len(items)}  |  Total labels: "
+                     f"{sum(i.get('qty_to_print', 0) for i in items)}")
+        lines.append("")
+        for idx, item in enumerate(items[:10], 1):   # preview first 10
+            lines.append(f"{'─' * 60}")
+            lines.append(f"[{idx}]  {item.get('title','')}  "
+                         f"({item.get('variant_label','')})  "
+                         f"x{item.get('qty_to_print', 0)}")
+            lines.append("")
+            lines.append(preview_job._generate_label_tspl(item))
+        if len(items) > 10:
+            lines.append(f"... and {len(items) - 10} more items (showing first 10)")
+
+        dialog = _TextDialog(
+            parent=self,
+            title=f"TSPL Preview — Request #{request['id']}",
+            content="\n".join(lines),
+            color_bg=self.C_BG,
+            color_text=self.C_TEXT,
+            color_border=self.C_BORDER,
+            color_surface=self.C_SURFACE,
+            color_gold=self.C_GOLD,
+        )
+        dialog.exec()
+
+    # ─────────────────────────────────────────────────────────────
+    # Visual QPainter label preview
+    # ─────────────────────────────────────────────────────────────
+    def show_visual_preview(self):
+        """Open a rendered visual preview of how labels will look when printed."""
+        request = self._selected_request
+        if not request:
+            if self.pending_requests:
+                request = self.pending_requests[0]
+            else:
+                QMessageBox.information(
+                    self, "No Request Selected",
+                    "Select a request from the queue first, or refresh to load requests.",
+                )
+                return
+
+        try:
+            headers  = {"X-API-Key": self.api_key}
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                headers=headers, timeout=10,
+            )
+            if response.status_code != 200:
+                QMessageBox.warning(
+                    self, "Cannot Load",
+                    f"Server returned {response.status_code}.",
+                )
+                return
+            items = response.json().get("items", [])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to fetch items: {e}")
+            return
+
+        if not items:
+            QMessageBox.information(self, "No Items", "This request has no items.")
+            return
+
+        dialog = _VisualPreviewDialog(
+            parent         = self,
+            request_id     = request['id'],
+            items          = items,
+            color_bg       = self.C_BG,
+            color_text     = self.C_TEXT,
+            color_text_dim = self.C_TEXT_DIM,
+            color_border   = self.C_BORDER,
+            color_surface  = self.C_SURFACE,
+            color_gold     = self.C_GOLD,
+        )
+        dialog.exec()
+
+    # ─────────────────────────────────────────────────────────────
+    # Standalone Test Label (not coupled to calibration)
+    # ─────────────────────────────────────────────────────────────
+    def print_test_label_standalone(self):
+        """Print a single representative test label to check layout without calibrating."""
+        if not self.selected_printer:
+            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
+            return
+
+        test_item = {
+            "title": "Bayt Al Emirati",
+            "variant_label": "Al Maisa Cape - Black",
+            "sku": "ALM-CAP-SIN-BLK-L",
+            "code39": "99001",
+            "price_cents": 95000,
+            "currency": "ZAR",
+            "qty_to_print": 1,
+        }
+
+        reply = QMessageBox.question(
+            self, "Print Test Label",
+            "This will print 1 test label using sample data.\n"
+            "SKU: ALM-CAP-SIN-BLK-L  |  Price: R950.00\n\n"
+            "Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        job = PrintJob(self.selected_printer, [test_item])
+        job.finished.connect(self._on_test_label_standalone_finished)
+        self.status_bar.showMessage("Printing test label…")
+        job.start()
+        # Keep a reference so it isn't GC'd
+        self._test_label_job = job
+
+    def _on_test_label_standalone_finished(self, success: bool, message: str):
+        self._test_label_job = None
+        if success:
+            QMessageBox.information(self, "Test Label Sent",
+                "Test label sent to printer.\n\n"
+                "Check the label for:\n"
+                "  • Title and variant text at top\n"
+                "  • Price in font 3 (medium, not giant)\n"
+                "  • Barcode fits on the 40 mm width\n"
+                "  • SKU readable at bottom")
+        else:
+            QMessageBox.critical(self, "Test Label Failed", message)
+        self.status_bar.showMessage("Ready")
+
+    # ─────────────────────────────────────────────────────────────
+    # Print History & Reprint
+    # ─────────────────────────────────────────────────────────────
+    def _save_to_history(self, request: Optional[Dict[str, Any]]):
+        """Append a successfully printed request to the local history file."""
+        if not request:
+            return
+        try:
+            APP_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            history: list = []
+            if APP_HISTORY_FILE.exists():
+                try:
+                    with open(APP_HISTORY_FILE, "r", encoding="utf-8") as f:
+                        history = json.load(f)
+                    if not isinstance(history, list):
+                        history = []
+                except Exception:
+                    history = []
+
+            entry = {
+                "id": request.get("id"),
+                "source": request.get("source", ""),
+                "created_by": request.get("created_by_username", ""),
+                "total_labels": request.get("total_labels", 0),
+                "note": request.get("note", ""),
+                "printed_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            history.insert(0, entry)      # newest first
+            history = history[:200]        # keep last 200 entries
+
+            with open(APP_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            print(f"Warning: could not save print history: {e}")
+
+    def show_print_history(self):
+        """Open the print history dialog with reprint buttons."""
+        try:
+            history: list = []
+            if APP_HISTORY_FILE.exists():
+                with open(APP_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                if not isinstance(history, list):
+                    history = []
+        except Exception:
+            history = []
+
+        dialog = _HistoryDialog(
+            parent=self,
+            history=history,
+            on_reprint=self._reprint_history_entry,
+            color_bg=self.C_BG,
+            color_text=self.C_TEXT,
+            color_text_dim=self.C_TEXT_DIM,
+            color_border=self.C_BORDER,
+            color_surface=self.C_SURFACE,
+            color_surface2=self.C_SURFACE2,
+            color_gold=self.C_GOLD,
+            color_gold_hi=self.C_GOLD_HI,
+            color_gold_dim=self.C_GOLD_DIM,
+        )
+        dialog.exec()
+
+    def _reprint_history_entry(self, entry: Dict[str, Any]):
+        """Re-fetch a previously printed request by ID and print it again."""
+        if not self.selected_printer:
+            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
+            return
+
+        request_id = entry.get("id")
+        if not request_id:
+            QMessageBox.warning(self, "Missing ID", "This history entry has no request ID.")
+            return
+
+        try:
+            headers = {"X-API-Key": self.api_key}
+            response = requests.get(
+                f"{self.api_base_url}/admin/api/label-printing/request/{request_id}",
+                headers=headers, timeout=10
+            )
+            if response.status_code != 200:
+                QMessageBox.critical(self, "Reprint Failed",
+                    f"Server returned {response.status_code}.\n"
+                    "The request may have been deleted from the server.\n"
+                    "You can only reprint requests that still exist on the server.")
+                return
+            data = response.json()
+            items = data.get("items", [])
+        except Exception as e:
+            QMessageBox.critical(self, "Reprint Failed", f"Could not fetch request: {e}")
+            return
+
+        if not items:
+            QMessageBox.warning(self, "No Items", "This request has no items to reprint.")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Confirm Reprint",
+            f"Reprint request #{request_id}?\n"
+            f"Originally printed: {entry.get('printed_at', 'unknown')}\n"
+            f"Total labels: {entry.get('total_labels', 0)}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._current_print_request = None   # don't re-save to history for reprints
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.print_job = PrintJob(self.selected_printer, items)
+        self.print_job.progress.connect(self.on_print_progress)
+        self.print_job.finished.connect(
+            lambda s, m: self._on_reprint_finished(s, m, request_id)
+        )
+        self.print_job.start()
+        self.status_bar.showMessage(f"Reprinting request #{request_id}…")
+
+    def _on_reprint_finished(self, success: bool, message: str, request_id: int):
+        """Handle reprint job completion."""
+        self.progress_bar.setVisible(False)
+        if success:
+            QMessageBox.information(self, "Reprint Complete",
+                f"Request #{request_id} reprinted successfully.")
+        else:
+            QMessageBox.critical(self, "Reprint Failed", message)
+        self.status_bar.showMessage("Ready")
+
+    # ─────────────────────────────────────────────────────────────
+    # Window close guard
+    # ─────────────────────────────────────────────────────────────
+    def closeEvent(self, event):
+        """Intercept window close to prevent accidental shutdown.
+
+        The app is managed as a systemd user service; closing the window
+        would stop the service.  We instead offer to minimize so the app
+        keeps running in the taskbar.  A developer who truly wants to stop
+        it can use ``systemctl --user stop bayt-printer`` or choose
+        'Force Quit' here.
+        """
+        reply = QMessageBox.question(
+            self,
+            "Close Application?",
+            "This app is managed as a system service and should stay running.\n\n"
+            "  ▸  Click \"Minimize\" to keep it in the taskbar (recommended).\n"
+            "  ▸  Click \"Force Quit\" to stop the process entirely.\n\n"
+            "For developers: systemctl --user stop bayt-printer",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            event.accept()   # Force Quit
+        else:
+            event.ignore()
+            self.showMinimized()
+
+    # ─────────────────────────────────────────────────────────────
+    # In-app updater
+    # ─────────────────────────────────────────────────────────────
+    def _current_version(self) -> str:
+        """Return the current git short SHA as a version string."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, cwd=Path(__file__).parent,
+                timeout=3,
+            )
+            return f"rev {result.stdout.strip()}" if result.returncode == 0 else "unknown"
+        except Exception:
+            return "unknown"
+
+    def _do_update(self):
+        """Run update.sh in a dialog showing live output, then restart the service."""
+        update_script = Path(__file__).parent / "update.sh"
+        if not update_script.exists():
+            QMessageBox.critical(self, "Update Script Missing",
+                f"Could not find update.sh at:\n{update_script}")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Update App",
+            "This will:\n"
+            "  1. Pull the latest code from GitHub\n"
+            "  2. Refresh Python dependencies\n"
+            "  3. Restart the systemd service (app will reload)\n\n"
+            "The window will close after the restart is triggered.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        dialog = _UpdateDialog(
+            parent=self,
+            script_path=str(update_script),
+            color_bg=self.C_BG,
+            color_text=self.C_TEXT,
+            color_border=self.C_BORDER,
+            color_surface=self.C_SURFACE,
+            color_gold=self.C_GOLD,
+        )
+        dialog.exec()
+
+        # Refresh the version label after update
+        self.version_label.setText(self._current_version())
+
+
+# ─────────────────────────────────────────────────────────────────
+# Helper dialogs
+# ─────────────────────────────────────────────────────────────────
+
+class _VisualPreviewDialog(QDialog):
+    """QPainter-rendered visual label preview with item navigation."""
+
+    def __init__(self, parent, request_id: int, items: list,
+                 color_bg, color_text, color_text_dim, color_border,
+                 color_surface, color_gold):
+        super().__init__(parent)
+        self.setWindowTitle(f"Visual Label Preview — Request #{request_id}")
+        self.resize(860, 680)
+        self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
+
+        self._items    = items
+        self._idx      = 0
+        self._renderer = TSPLRenderer()
+        self._job      = PrintJob("", items)
+        self._C = dict(text=color_text, dim=color_text_dim, border=color_border,
+                       surface=color_surface, gold=color_gold, bg=color_bg)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        # ── Item info row ──────────────────────────────────────────
+        info_row = QHBoxLayout()
+        self._info_label = QLabel()
+        self._info_label.setStyleSheet(
+            f"color:{color_text}; font-size:13px; font-weight:600; background:transparent;"
+        )
+        info_row.addWidget(self._info_label)
+        info_row.addStretch()
+        self._counter_label = QLabel()
+        self._counter_label.setStyleSheet(
+            f"color:{color_text_dim}; font-size:12px; background:transparent;"
+        )
+        info_row.addWidget(self._counter_label)
+        layout.addLayout(info_row)
+
+        # ── Rendered pixmap area ───────────────────────────────────
+        self._pixmap_label = QLabel()
+        self._pixmap_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pixmap_label.setStyleSheet(
+            f"background:{color_surface}; border:1px solid {color_border};"
+            f" border-radius:8px; padding:12px;"
+        )
+        self._pixmap_label.setMinimumHeight(400)
+        layout.addWidget(self._pixmap_label, stretch=1)
+
+        # ── Navigation row ─────────────────────────────────────────
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(8)
+
+        _sec_style = (
+            f"QPushButton {{background:{color_surface}; color:{color_text};"
+            f" border:1px solid {color_border}; border-radius:6px;"
+            f" padding:4px 16px; font-size:13px;}}"
+            f"QPushButton:hover {{background:{color_border};}}"
+            f"QPushButton:disabled {{color:{color_text_dim}; border-color:{color_border};}}"
+        )
+        _gold_style = (
+            f"QPushButton {{background:{color_gold}; color:#000; border:none;"
+            f" border-radius:6px; padding:4px 20px; font-weight:700; font-size:13px;}}"
+        )
+
+        self._prev_btn = QPushButton("◀  Prev")
+        self._prev_btn.setFixedHeight(36)
+        self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prev_btn.setStyleSheet(_sec_style)
+        self._prev_btn.clicked.connect(self._go_prev)
+        nav_row.addWidget(self._prev_btn)
+
+        self._next_btn = QPushButton("Next  ▶")
+        self._next_btn.setFixedHeight(36)
+        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn.setStyleSheet(_sec_style)
+        self._next_btn.clicked.connect(self._go_next)
+        nav_row.addWidget(self._next_btn)
+
+        nav_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(36)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(_gold_style)
+        close_btn.clicked.connect(self.accept)
+        nav_row.addWidget(close_btn)
+
+        layout.addLayout(nav_row)
+
+        self._refresh()
+
+    # -------------------------------------------------------------- #
+    def _refresh(self) -> None:
+        item    = self._items[self._idx]
+        title   = item.get('title',         '')
+        variant = item.get('variant_label', '')
+        sku     = item.get('sku',           '')
+        qty     = item.get('qty_to_print',   0)
+
+        info = title
+        if variant: info += f"  ·  {variant}"
+        if sku:     info += f"  ·  SKU: {sku}"
+        info += f"  ·  Qty: {qty}"
+        self._info_label.setText(info)
+        self._counter_label.setText(f"Item {self._idx + 1} of {len(self._items)}")
+
+        tspl   = self._job._generate_label_tspl(item)
+        pixmap = self._renderer.render(tspl)
+
+        # Fit pixmap to available area while keeping label aspect ratio
+        avail_w = max(100, self._pixmap_label.width()  - 28)
+        avail_h = max(100, self._pixmap_label.height() - 28)
+        scaled  = pixmap.scaled(
+            avail_w, avail_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._pixmap_label.setPixmap(scaled)
+
+        self._prev_btn.setEnabled(self._idx > 0)
+        self._next_btn.setEnabled(self._idx < len(self._items) - 1)
+
+    def _go_prev(self) -> None:
+        if self._idx > 0:
+            self._idx -= 1
+            self._refresh()
+
+    def _go_next(self) -> None:
+        if self._idx < len(self._items) - 1:
+            self._idx += 1
+            self._refresh()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._items:
+            self._refresh()
+
+
+class _TextDialog(QDialog):
+    """Generic scrollable monospace text preview dialog (TSPL visualiser)."""
+
+    def __init__(self, parent, title: str, content: str,
+                 color_bg, color_text, color_border, color_surface, color_gold):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 640)
+        self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        heading = QLabel(title)
+        heading.setStyleSheet(
+            f"color:{color_text}; font-size:14px; font-weight:700;"
+        )
+        layout.addWidget(heading)
+
+        text_area = QTextEdit()
+        text_area.setReadOnly(True)
+        text_area.setPlainText(content)
+        text_area.setFont(__import__('PyQt6.QtGui', fromlist=['QFont']).QFont("Courier New", 10))
+        text_area.setStyleSheet(
+            f"background:{color_surface}; color:{color_text};"
+            f"border:1px solid {color_border}; border-radius:6px; padding:8px;"
+        )
+        layout.addWidget(text_area, stretch=1)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(34)
+        close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background:{color_gold}; color:#000; border:none;"
+            f" border-radius:6px; padding:6px 20px; font-weight:700; }}"
+            f"QPushButton:hover {{ background:{color_gold}; }}"
+        )
+        close_btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+
+class _HistoryDialog(QDialog):
+    """Print history dialog listing completed jobs with Reprint buttons."""
+
+    def __init__(self, parent, history: list, on_reprint,
+                 color_bg, color_text, color_text_dim, color_border,
+                 color_surface, color_surface2, color_gold, color_gold_hi, color_gold_dim):
+        super().__init__(parent)
+        self.setWindowTitle("Print History")
+        self.resize(760, 520)
+        self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
+        self._on_reprint = on_reprint
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        heading = QLabel("Print History  —  click Reprint to re-send a previous job")
+        heading.setStyleSheet(
+            f"color:{color_text}; font-size:14px; font-weight:700;"
+        )
+        layout.addWidget(heading)
+
+        if not history:
+            empty = QLabel("No print history yet. Print a job first.")
+            empty.setStyleSheet(f"color:{color_text_dim}; font-size:12px; padding:20px;")
+            empty.setAlignment(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(empty)
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet(
+                f"QScrollArea {{ border:none; background:transparent; }}"
+                f"QScrollBar:vertical {{ width:6px; background:transparent; }}"
+                f"QScrollBar::handle:vertical {{ background:{color_border}; border-radius:3px; }}"
+            )
+            inner = QWidget()
+            inner.setStyleSheet(f"background:{color_bg};")
+            inner_layout = QVBoxLayout(inner)
+            inner_layout.setContentsMargins(0, 0, 8, 0)
+            inner_layout.setSpacing(6)
+
+            btn_style = (
+                f"QPushButton {{ background:{color_gold}; color:#000; border:none;"
+                f" border-radius:5px; padding:5px 14px; font-size:11px; font-weight:700; }}"
+                f"QPushButton:hover {{ background:{color_gold_hi}; }}"
+                f"QPushButton:pressed {{ background:{color_gold_dim}; }}"
+            )
+            row_style = (
+                f"background:{color_surface}; border:1px solid {color_border};"
+                f" border-radius:7px;"
+            )
+
+            for entry in history:
+                row_widget = QWidget()
+                row_widget.setStyleSheet(row_style)
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(14, 10, 10, 10)
+                row_layout.setSpacing(12)
+
+                info_layout = QVBoxLayout()
+                info_layout.setSpacing(2)
+
+                top_text = (
+                    f"#{entry.get('id', '?')}  •  "
+                    f"{entry.get('source', '').replace('_', ' ').title()}  —  "
+                    f"{entry.get('total_labels', 0)} label(s)"
+                )
+                top_lbl = QLabel(top_text)
+                top_lbl.setStyleSheet(
+                    f"color:{color_text}; font-size:12px; font-weight:600;"
+                    f" background:transparent; border:none;"
+                )
+                sub_text = (
+                    f"Printed: {entry.get('printed_at', 'unknown')}  •  "
+                    f"By: {entry.get('created_by', 'unknown')}"
+                )
+                if entry.get('note'):
+                    sub_text += f"  •  {entry['note']}"
+                sub_lbl = QLabel(sub_text)
+                sub_lbl.setStyleSheet(
+                    f"color:{color_text_dim}; font-size:11px;"
+                    f" background:transparent; border:none;"
+                )
+
+                info_layout.addWidget(top_lbl)
+                info_layout.addWidget(sub_lbl)
+                row_layout.addLayout(info_layout, stretch=1)
+
+                reprint_btn = QPushButton("Reprint")
+                reprint_btn.setFixedSize(80, 30)
+                reprint_btn.setCursor(
+                    __import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor
+                )
+                reprint_btn.setStyleSheet(btn_style)
+                reprint_btn.clicked.connect(
+                    lambda checked, e=entry: self._do_reprint(e)
+                )
+                row_layout.addWidget(reprint_btn)
+
+                inner_layout.addWidget(row_widget)
+
+            inner_layout.addStretch()
+            scroll.setWidget(inner)
+            layout.addWidget(scroll, stretch=1)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(34)
+        close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background:{color_gold}; color:#000; border:none;"
+            f" border-radius:6px; padding:6px 20px; font-weight:700; }}"
+        )
+        close_btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _do_reprint(self, entry: dict):
+        self.accept()  # close dialog first
+        self._on_reprint(entry)
+
+
+class _UpdateDialog(QDialog):
+    """Shows live output from update.sh and restarts the service when done."""
+
+    def __init__(self, parent, script_path: str,
+                 color_bg, color_text, color_border, color_surface, color_gold):
+        super().__init__(parent)
+        self.setWindowTitle("Update App")
+        self.resize(760, 480)
+        self.setStyleSheet(f"background:{color_bg}; color:{color_text};")
+        self._script_path = script_path
+        self._process: Optional[QProcess] = None
+        self._finished = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        heading = QLabel("⇡  Updating Bayt Al Emirati Label Printer")
+        heading.setStyleSheet(f"color:{color_text}; font-size:14px; font-weight:700;")
+        layout.addWidget(heading)
+
+        sub = QLabel("Pulling latest code from GitHub and refreshing dependencies…")
+        sub.setStyleSheet(f"color:{color_text}; font-size:11px; background:transparent; border:none;")
+        layout.addWidget(sub)
+
+        self._output = QTextEdit()
+        self._output.setReadOnly(True)
+        self._output.setFont(__import__('PyQt6.QtGui', fromlist=['QFont']).QFont("Courier New", 10))
+        self._output.setStyleSheet(
+            f"background:{color_surface}; color:{color_text};"
+            f"border:1px solid {color_border}; border-radius:6px; padding:8px;"
+        )
+        layout.addWidget(self._output, stretch=1)
+
+        self._status_lbl = QLabel("Running…")
+        self._status_lbl.setStyleSheet(
+            f"color:{color_text}; font-size:11px; background:transparent; border:none;"
+        )
+        layout.addWidget(self._status_lbl)
+
+        btn_row = QHBoxLayout()
+        self._close_btn = QPushButton("Close")
+        self._close_btn.setFixedHeight(34)
+        self._close_btn.setEnabled(False)  # Only enabled after script finishes
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(
+            f"QPushButton {{ background:{color_gold}; color:#000; border:none;"
+            f" border-radius:6px; padding:6px 20px; font-weight:700; }}"
+            f"QPushButton:disabled {{ background:#555; color:#888; }}"
+        )
+        self._close_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(self._close_btn)
+        layout.addLayout(btn_row)
+
+        # Start the update script immediately
+        self._run()
+
+    def _run(self):
+        self._process = QProcess(self)
+        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._process.readyReadStandardOutput.connect(self._read_output)
+        self._process.finished.connect(self._on_finished)
+        self._process.start("/bin/bash", [self._script_path])
+
+    def _read_output(self):
+        if self._process is None:
+            return
+        raw = bytes(self._process.readAllStandardOutput())
+        text = raw.decode("utf-8", errors="replace")
+        self._output.moveCursor(__import__('PyQt6.QtGui', fromlist=['QTextCursor']).QTextCursor.MoveOperation.End)
+        self._output.insertPlainText(text)
+        self._output.moveCursor(__import__('PyQt6.QtGui', fromlist=['QTextCursor']).QTextCursor.MoveOperation.End)
+
+    def _on_finished(self, exit_code: int, _exit_status):
+        self._finished = True
+        if exit_code == 0:
+            self._status_lbl.setText(
+                "✓ Update complete — the service has been restarted. "
+                "The UI will refresh automatically."
+            )
+        else:
+            self._status_lbl.setText(
+                f"✗ Update script exited with code {exit_code}. "
+                "Check the output above for details."
+            )
+        self._close_btn.setEnabled(True)
+
+    def closeEvent(self, event):
+        """Kill the script if the dialog is closed early."""
+        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
+            self._process.kill()
+        event.accept()
 
 
 def main():

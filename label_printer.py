@@ -404,11 +404,11 @@ class LabelPrinter:
 
         if line2:
             tspl = (
-                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0,0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
+                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
                 f'TEXT 20,16,\\"2\\",0,1,1,\\"{safe_line1}\\"\\n'
                 f'TEXT 20,36,\\"2\\",0,1,1,\\"{safe_line2}\\"\\n'
                 f'BAR 20,56,280,2\\n'
-                f'TEXT 20,66,\\"4\\",0,1,1,\\"{safe_price}\\"\\n'
+                f'TEXT 20,66,\\"3\\",0,1,1,\\"{safe_price}\\"\\n'
                 f'TEXT 20,95,\\"2\\",0,1,1,\\"Size: {safe_size}\\"\\n'
                 f'TEXT 20,113,\\"2\\",0,1,1,\\"{safe_colour}\\"\\n'
                 f'BARCODE {barcode_x},135,\\"39\\",70,0,0,1,2,\\"{safe_barcode}\\"\\n'
@@ -417,10 +417,10 @@ class LabelPrinter:
             )
         else:
             tspl = (
-                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0,0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
+                f'SIZE 40 mm,30 mm\\nGAP 2 mm,0\\nDIRECTION 0\\nSHIFT {self.horizontal_shift_dots}\\nCLS\\n'
                 f'TEXT 20,16,\\"2\\",0,1,1,\\"{safe_line1}\\"\\n'
                 f'BAR 20,56,280,2\\n'
-                f'TEXT 20,66,\\"4\\",0,1,1,\\"{safe_price}\\"\\n'
+                f'TEXT 20,66,\\"3\\",0,1,1,\\"{safe_price}\\"\\n'
                 f'TEXT 20,95,\\"2\\",0,1,1,\\"Size: {safe_size}\\"\\n'
                 f'TEXT 20,113,\\"2\\",0,1,1,\\"{safe_colour}\\"\\n'
                 f'BARCODE {barcode_x},135,\\"39\\",70,0,0,1,2,\\"{safe_barcode}\\"\\n'
@@ -439,7 +439,7 @@ class LabelPrinter:
                 '~!T',  # Reset printer to defaults
                 'SIZE 40 mm,30 mm',
                 'GAP 2 mm,0',
-                'DIRECTION 0,0',  # Set to normal direction
+                'DIRECTION 0',  # Set to normal direction (single arg — TSPL standard)
                 f'SHIFT {self.horizontal_shift_dots}',
                 'OFFSET 0',  # No vertical offset
                 'SPEED 4',  # Set print speed

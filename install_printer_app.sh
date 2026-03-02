@@ -1,91 +1,207 @@
 #!/bin/bash
 #
-# Bayt Al Emirati Label Printer - Installation Script
-# For Debian 13 Trixie
+# Bayt Al Emirati Label Printer — Installation Script
+# Installs as a systemd user service that auto-starts on login.
+#
+# Usage (either form works):
+#   bash install_printer_app.sh        ← recommended
+#   sudo bash install_printer_app.sh   ← also works
 #
 
 set -e
 
-echo "======================================================"
-echo "  Bayt Al Emirati Automated Label Printer Installation"
-echo "======================================================"
-echo ""
-
-# Check if running on Debian
-if [ ! -f /etc/debian_version ]; then
-    echo "Warning: This script is designed for Debian systems."
-    read -p "Continue anyway? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
+# ──────────────────────────────────────────────────────────────────
+# Resolve the REAL user and their home, regardless of whether the
+# script was invoked with or without sudo.
+#
+#   sudo ./install_printer_app.sh  → EUID=0, SUDO_USER=nero
+#   ./install_printer_app.sh       → EUID=1000, SUDO_USER unset
+# ──────────────────────────────────────────────────────────────────
+if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_USER="$USER"
+    REAL_HOME="$HOME"
 fi
 
-# Update package list
-echo "Updating package list..."
-sudo apt-get update
+# Helper: run a command AS the real (non-root) user.
+# Falls through to a plain call when not running as root.
+as_user() {
+    if [ "$EUID" -eq 0 ]; then
+        sudo -u "$REAL_USER" --preserve-env=DISPLAY,WAYLAND_DISPLAY,DBUS_SESSION_BUS_ADDRESS \
+            env HOME="$REAL_HOME" XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" \
+            "$@"
+    else
+        "$@"
+    fi
+}
 
-# Install system dependencies
+# Helper: run apt-get (needs root).
+apt_install() {
+    if [ "$EUID" -eq 0 ]; then
+        apt-get "$@"
+    else
+        sudo apt-get "$@"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────
+# Resolve project directory regardless of how the script was called
+# ──────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR"
+
+SERVICE_NAME="bayt-printer"
+SERVICE_FILE="$REAL_HOME/.config/systemd/user/${SERVICE_NAME}.service"
+LEGACY_AUTOSTART="$REAL_HOME/.config/autostart/bayt-printer.desktop"
+
 echo ""
-echo "Installing system dependencies..."
-sudo apt-get install -y \
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║   Bayt Al Emirati Label Printer — Installer          ║"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
+echo "  Installing for user: $REAL_USER  ($REAL_HOME)"
+echo ""
+
+# ── 1. OS check ───────────────────────────────────────────────────
+if [ ! -f /etc/debian_version ]; then
+    echo "⚠  Warning: This script targets Debian/Ubuntu systems."
+    read -p "   Continue anyway? (y/N) " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+fi
+
+# ── 2. System dependencies (always needs root) ────────────────────
+echo "📦 Installing system dependencies…"
+apt_install update -qq
+apt_install install -y \
     python3 \
     python3-pip \
     python3-venv \
     python3-pyqt6 \
     libusb-1.0-0 \
-    cups
+    cups \
+    git
+echo "   ✓ System packages OK"
 
-# Create virtual environment
+# ── 3. Python virtual environment (must run as REAL_USER) ────────
 echo ""
-echo "Creating Python virtual environment..."
-python3 -m venv venv
+echo "🐍 Setting up Python virtual environment…"
 
-# Activate virtual environment
-source venv/bin/activate
+# Remove any stale venv that was created as the wrong user.
+# We do this as root (rm -rf) then recreate as the real user.
+if [ -d "$SCRIPT_DIR/venv" ]; then
+    VENV_OWNER=$(stat -c '%U' "$SCRIPT_DIR/venv" 2>/dev/null || echo "unknown")
+    if [ "$VENV_OWNER" != "$REAL_USER" ]; then
+        echo "   ↳ Removing stale venv owned by '$VENV_OWNER'…"
+        rm -rf "$SCRIPT_DIR/venv"
+        echo "   ✓ Stale venv removed"
+    else
+        echo "   ↳ Existing venv owned by '$REAL_USER' — will reuse"
+    fi
+fi
 
-# Install Python dependencies
+# --system-site-packages lets the venv inherit python3-pyqt6, python3-pip etc.
+# that were just installed via apt.  This is MUCH faster than re-downloading
+# PyQt6 (~50 MB) through pip and avoids the "frozen" appearance.
+if [ ! -d "$SCRIPT_DIR/venv" ]; then
+    echo "   ↳ Creating venv (this takes ~10 seconds)…"
+    as_user python3 -m venv --system-site-packages "$SCRIPT_DIR/venv"
+    echo "   ✓ venv created"
+fi
+
+# Only install the packages that are NOT already provided by the system.
+# pip will skip anything already present — output is visible (no -q flag).
+echo "   ↳ Installing/verifying Python packages…"
+echo "   ℹ  PyQt6 comes from the system apt package — no large download needed."
+as_user "$SCRIPT_DIR/venv/bin/pip" install -r "$SCRIPT_DIR/requirements_app.txt"
+echo "   ✓ venv ready  (owner: $REAL_USER)"
+
+# ── 4. Make scripts executable ───────────────────────────────────
+chmod +x "$SCRIPT_DIR/bayt_printer_app.py"
+chmod +x "$SCRIPT_DIR/launch_printer.sh"
+[ -f "$SCRIPT_DIR/update.sh" ]    && chmod +x "$SCRIPT_DIR/update.sh"
+[ -f "$SCRIPT_DIR/uninstall.sh" ] && chmod +x "$SCRIPT_DIR/uninstall.sh"
+
+# Ensure the whole project directory is owned by the real user
+if [ "$EUID" -eq 0 ]; then
+    chown -R "$REAL_USER":"$REAL_USER" "$SCRIPT_DIR"
+fi
+
+# ── 5. Remove legacy desktop-session autostart (replaced by service) ─
+if [ -f "$LEGACY_AUTOSTART" ]; then
+    rm -f "$LEGACY_AUTOSTART"
+    echo "   ↳ Removed legacy autostart desktop entry"
+fi
+
+# ── 6. Write systemd user service ────────────────────────────────
 echo ""
-echo "Installing Python packages..."
-pip install --upgrade pip
-pip install -r requirements_app.txt
+echo "⚙  Installing systemd user service…"
+as_user mkdir -p "$REAL_HOME/.config/systemd/user"
 
-# Make app executable
-chmod +x bayt_printer_app.py
-chmod +x launch_printer.sh
+# Write the service file as the real user
+as_user bash -c "cat > '$SERVICE_FILE'" <<EOF
+[Unit]
+Description=Bayt Al Emirati Label Printer
+Documentation=https://github.com/Rosso-OmniForge/Raw-Barcode-Printer
+After=graphical-session.target network-online.target
+Wants=graphical-session.target
 
-# Configure desktop-session autostart
-echo ""
-echo "Configuring autostart on login..."
-AUTOSTART_DIR="$HOME/.config/autostart"
-AUTOSTART_FILE="$AUTOSTART_DIR/bayt-printer.desktop"
-mkdir -p "$AUTOSTART_DIR"
+[Service]
+Type=simple
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=${SCRIPT_DIR}/launch_printer.sh
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
-cat > "$AUTOSTART_FILE" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Bayt Al Emirati Printer
-Comment=Start Bayt label printer app on login
-Exec=$PWD/launch_printer.sh
-Path=$PWD
-Terminal=false
-X-GNOME-Autostart-enabled=true
-Categories=Utility;
+[Install]
+WantedBy=graphical-session.target
 EOF
 
-chmod 644 "$AUTOSTART_FILE"
+echo "   ✓ Service file: $SERVICE_FILE"
 
+# ── 7. Enable lingering so user services start at boot ───────────
 echo ""
-echo "================================================"
-echo "  Installation Complete!"
-echo "================================================"
+echo "🔐 Enabling loginctl linger for $REAL_USER…"
+loginctl enable-linger "$REAL_USER" 2>/dev/null && echo "   ✓ Linger enabled" || \
+    echo "   ⚠  Could not enable linger (may need systemd ≥ 230)"
+
+# ── 8. Reload → enable → (re)start the service ───────────────────
 echo ""
-echo "Autostart configured: $AUTOSTART_FILE"
-echo "App will launch automatically at desktop login."
+echo "🚀 Starting service…"
+as_user systemctl --user daemon-reload
+as_user systemctl --user enable "${SERVICE_NAME}.service"
+as_user systemctl --user stop   "${SERVICE_NAME}.service" 2>/dev/null || true
+as_user systemctl --user start  "${SERVICE_NAME}.service"
+
+sleep 1
+if as_user systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
+    echo "   ✓ Service is RUNNING"
+else
+    echo "   ⚠  Service not yet active — normal if display session is not"
+    echo "      available yet. It will start automatically on next login."
+    echo "      Check: systemctl --user status ${SERVICE_NAME}"
+fi
+
+# ── 9. Summary ───────────────────────────────────────────────────
 echo ""
-echo "To run the application:"
-echo "  1. Activate virtual environment: source venv/bin/activate"
-echo "  2. Run: python3 bayt_printer_app.py"
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║   ✅ Installation Complete!                           ║"
+echo "╚══════════════════════════════════════════════════════╝"
 echo ""
-echo "Or use the launcher script: ./launch_printer.sh"
+echo "  Service:   ${SERVICE_NAME}.service"
+echo "  Source:    ${SCRIPT_DIR}"
+echo "  User:      ${REAL_USER}"
+echo ""
+echo "  Useful commands:"
+echo "    Status   →  systemctl --user status  ${SERVICE_NAME}"
+echo "    Logs     →  journalctl --user -u ${SERVICE_NAME} -f"
+echo "    Stop     →  systemctl --user stop    ${SERVICE_NAME}"
+echo "    Restart  →  systemctl --user restart ${SERVICE_NAME}"
+echo ""
+echo "  To update:   bash update.sh"
+echo "  To remove:   bash uninstall.sh"
 echo ""

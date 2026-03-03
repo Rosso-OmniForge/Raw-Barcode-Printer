@@ -276,29 +276,28 @@ class PrintJob(QThread):
         tspl.append("SET TEAR ON")
         tspl.append("CLS")
         
+        # All elements are left-aligned at a consistent left margin.
+        # Centering was causing content to be cut off on short/long strings.
+        LM = 10   # left margin in dots
+
         # Title (top)
-        title_x = self._center_x_for_text(title, "3")
-        tspl.append(f'TEXT {title_x},5,"3",0,1,1,"{self._tspl_escape(title)}"')
+        tspl.append(f'TEXT {LM},5,"3",0,1,1,"{self._tspl_escape(title)}"')
 
         # Variant label (below title)
         if variant_label:
-            variant_x = self._center_x_for_text(variant_label, "2")
-            tspl.append(f'TEXT {variant_x},27,"2",0,1,1,"{self._tspl_escape(variant_label)}"')
+            tspl.append(f'TEXT {LM},27,"2",0,1,1,"{self._tspl_escape(variant_label)}"')
 
-        # Separator bar
-        tspl.append("BAR 20,44,280,2")
+        # Separator bar — full printable width
+        tspl.append(f"BAR {LM},44,{self.label_width_dots - LM * 2},2")
 
         # Price (above barcode, font 3 scale 1×1 — matches proven working sample)
-        price_x = self._center_x_for_text(price, "3")
-        tspl.append(f'TEXT {price_x},50,"3",0,1,1,"{self._tspl_escape(price)}"')
+        tspl.append(f'TEXT {LM},50,"3",0,1,1,"{self._tspl_escape(price)}"')
 
         # Code39 barcode — narrow=1 wide=2 is the only setting that fits on a 40 mm label
-        bc_x = self._center_x_for_code39(code39, narrow=1, wide=2)
-        tspl.append(f'BARCODE {bc_x},78,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
+        tspl.append(f'BARCODE {LM},78,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
 
         # SKU (very bottom, small font)
-        sku_x = self._center_x_for_text(sku, "1")
-        tspl.append(f'TEXT {sku_x},215,"1",0,1,1,"{self._tspl_escape(sku)}"')
+        tspl.append(f'TEXT {LM},215,"1",0,1,1,"{self._tspl_escape(sku)}"')
         
         tspl.append("PRINT 1")
         
@@ -321,6 +320,15 @@ class PrintJob(QThread):
                     try:
                         with open(self.printer_device, 'wb') as printer:
                             printer.write(tspl.encode('utf-8'))
+                    except PermissionError:
+                        self.finished.emit(
+                            False,
+                            f"Permission denied: cannot write to {self.printer_device}.\n\n"
+                            f"The printer device requires the user to be in the 'lp' group.\n"
+                            f"Re-run the install script to fix this automatically, or run:\n"
+                            f"  sudo usermod -aG lp $USER  (then log out and back in)"
+                        )
+                        return
                     except Exception as e:
                         self.finished.emit(False, f"Printer error: {e}")
                         return
@@ -1029,49 +1037,55 @@ class BaytAlEmiratiPrinterApp(QMainWindow):
         if self.calibration_job and self.calibration_job.isRunning():
             QMessageBox.information(self, "Calibration In Progress", "Calibration is already running.")
             return
-        
+
+        # ── 1. Send the TSPL calibration sequence ────────────────────
+        calibration_tspl = (
+            "SIZE 40 mm,30 mm\n"
+            "GAP 2 mm,0\n"
+            "DIRECTION 0\n"
+            "REFERENCE 0,0\n"
+            "SET TEAR ON\n"
+            "SPEED 4\n"
+            "DENSITY 8\n"
+            "GAPDETECT\n"   # physically feeds and measures the gap
+            "HOME\n"        # advance to first clean label start
+        )
         try:
-            # Send full calibration sequence:
-            # 1. Set label dimensions and gap
-            # 2. GAPDETECT  — tells the printer to physically feed and measure the gap
-            # 3. HOME       — advances to the first clean label start position
-            # Without GAPDETECT the printer never actually runs its gap sensor, so
-            # "Calibrate" appeared to do nothing.
-            calibration_tspl = (
-                "SIZE 40 mm,30 mm\n"
-                "GAP 2 mm,0\n"
-                "DIRECTION 0\n"
-                "REFERENCE 0,0\n"
-                "SET TEAR ON\n"
-                "SPEED 4\n"
-                "DENSITY 8\n"
-                "GAPDETECT\n"   # <-- the actual calibration trigger
-                "HOME\n"        # <-- advance to first clean label start
-            )
             with open(self.selected_printer, 'wb') as printer:
                 printer.write(calibration_tspl.encode('utf-8'))
-
-            # Give the printer time to run the gap-detection feed (~1.5 s typical)
-            time.sleep(1.5)
-
-            # Print test label using real-looking data
-            test_item = {
-                "title": "BAYT AL EMIRATI",
-                "variant_label": "Calibration Test",
-                "sku": "CALIB-TEST",
-                "code39": "CALIBTEST",
-                "price_cents": 95000,
-                "currency": "ZAR"
-            }
-            
-            self.calibration_job = PrintJob(self.selected_printer, [test_item])
-            self.calibration_job.finished.connect(self.on_test_print_finished)
-            self.calibration_job.start()
-            
-            self.status_bar.showMessage("Calibrating printer...")
-            
+        except PermissionError:
+            QMessageBox.critical(
+                self, "Permission Denied",
+                f"Cannot write to {self.selected_printer}.\n\n"
+                f"The printer device requires your user account to be in the 'lp' group.\n\n"
+                f"Re-run the install script to fix this automatically, or run:\n"
+                f"  sudo usermod -aG lp $USER\n\n"
+                f"Then log out and back in (or reboot) for the change to take effect."
+            )
+            return
         except Exception as e:
             QMessageBox.critical(self, "Calibration Error", f"Failed to calibrate: {e}")
+            return
+
+        # Give the printer time to run the gap-detection feed (~1.5 s typical)
+        time.sleep(1.5)
+
+        # ── 2. Print a test label ─────────────────────────────────────
+        test_item = {
+            "title": "BAYT AL EMIRATI",
+            "variant_label": "Calibration Test",
+            "sku": "CALIB-TEST",
+            "code39": "CALIBTEST",
+            "price_cents": 95000,
+            "currency": "ZAR"
+        }
+
+        self.calibration_job = PrintJob(self.selected_printer, [test_item])
+        self.calibration_job.finished.connect(self.on_test_print_finished)
+        self.calibration_job.start()
+
+        self.status_bar.showMessage("Calibrating printer…")
+
     
     def on_test_print_finished(self, success: bool, message: str):
         """Handle test print completion."""

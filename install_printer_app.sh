@@ -85,7 +85,50 @@ apt_install install -y \
     git
 echo "   ✓ System packages OK"
 
-# ── 3. Python virtual environment (must run as REAL_USER) ────────
+# ── 3. Printer device permissions ────────────────────────────────
+# /dev/usb/lp* devices are owned by root:lp (mode 0660).
+# The running user must be in the 'lp' group to open them directly
+# without sudo.  We also install a udev rule so the group is applied
+# even if the default distro rule is missing.
+echo ""
+echo "🖨  Setting up printer device permissions…"
+
+# a) Create udev rule (needs root)
+UDEV_RULE="/etc/udev/rules.d/60-usb-label-printer.rules"
+if [ "$EUID" -eq 0 ]; then
+    cat > "$UDEV_RULE" <<'UDEV'
+# Grant the 'lp' group read-write access to USB printer devices
+SUBSYSTEM=="usb", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0664"
+UDEV
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+    echo "   ✓ udev rule written: $UDEV_RULE"
+else
+    sudo bash -c "cat > '$UDEV_RULE' <<'UDEV'
+# Grant the 'lp' group read-write access to USB printer devices
+SUBSYSTEM==\"usb\", KERNEL==\"lp[0-9]*\", GROUP=\"lp\", MODE=\"0664\"
+UDEV"
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=usb 2>/dev/null || true
+    echo "   ✓ udev rule written: $UDEV_RULE"
+fi
+
+# b) Add real user to 'lp' group
+if id -nG "$REAL_USER" | grep -qw lp; then
+    echo "   ✓ $REAL_USER is already in the 'lp' group"
+else
+    if [ "$EUID" -eq 0 ]; then
+        usermod -aG lp "$REAL_USER"
+    else
+        sudo usermod -aG lp "$REAL_USER"
+    fi
+    echo "   ✓ Added $REAL_USER to the 'lp' group"
+    echo "   ⚠  Group change takes effect on next login / reboot."
+    echo "      For this session, run:  newgrp lp"
+fi
+
+
+# ── 4. Python virtual environment (must run as REAL_USER) ────────
 echo ""
 echo "🐍 Setting up Python virtual environment…"
 
@@ -118,7 +161,7 @@ echo "   ℹ  PyQt6 comes from the system apt package — no large download need
 as_user "$SCRIPT_DIR/venv/bin/pip" install -r "$SCRIPT_DIR/requirements_app.txt"
 echo "   ✓ venv ready  (owner: $REAL_USER)"
 
-# ── 4. Make scripts executable ───────────────────────────────────
+# ── 5. Make scripts executable ───────────────────────────────────
 chmod +x "$SCRIPT_DIR/bayt_printer_app.py"
 chmod +x "$SCRIPT_DIR/launch_printer.sh"
 [ -f "$SCRIPT_DIR/update.sh" ]    && chmod +x "$SCRIPT_DIR/update.sh"
@@ -129,13 +172,13 @@ if [ "$EUID" -eq 0 ]; then
     chown -R "$REAL_USER":"$REAL_USER" "$SCRIPT_DIR"
 fi
 
-# ── 5. Remove legacy desktop-session autostart (replaced by service) ─
+# ── 6. Remove legacy desktop-session autostart (replaced by service) ─
 if [ -f "$LEGACY_AUTOSTART" ]; then
     rm -f "$LEGACY_AUTOSTART"
     echo "   ↳ Removed legacy autostart desktop entry"
 fi
 
-# ── 6. Write systemd user service ────────────────────────────────
+# ── 7. Write systemd user service ────────────────────────────────
 echo ""
 echo "⚙  Installing systemd user service…"
 as_user mkdir -p "$REAL_HOME/.config/systemd/user"
@@ -163,13 +206,13 @@ EOF
 
 echo "   ✓ Service file: $SERVICE_FILE"
 
-# ── 7. Enable lingering so user services start at boot ───────────
+# ── 8. Enable lingering so user services start at boot ───────────
 echo ""
 echo "🔐 Enabling loginctl linger for $REAL_USER…"
 loginctl enable-linger "$REAL_USER" 2>/dev/null && echo "   ✓ Linger enabled" || \
     echo "   ⚠  Could not enable linger (may need systemd ≥ 230)"
 
-# ── 8. Reload → enable → (re)start the service ───────────────────
+# ── 9. Reload → enable → (re)start the service ───────────────────
 echo ""
 echo "🚀 Starting service…"
 as_user systemctl --user daemon-reload
@@ -186,7 +229,7 @@ else
     echo "      Check: systemctl --user status ${SERVICE_NAME}"
 fi
 
-# ── 9. Summary ───────────────────────────────────────────────────
+# ── 10. Summary ──────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║   ✅ Installation Complete!                           ║"

@@ -290,11 +290,11 @@ class PrintJob(QThread):
         # Separator bar — full printable width
         tspl.append(f"BAR {LM},44,{self.label_width_dots - LM * 2},2")
 
-        # Price (above barcode, font 3 scale 1×1 — matches proven working sample)
-        tspl.append(f'TEXT {LM},50,"3",0,1,1,"{self._tspl_escape(price)}"')
+        # Price — font 4 (one step larger), with extra spacing below the separator
+        tspl.append(f'TEXT {LM},56,"4",0,1,1,"{self._tspl_escape(price)}"')
 
-        # Code39 barcode — narrow=1 wide=2 is the only setting that fits on a 40 mm label
-        tspl.append(f'BARCODE {LM},78,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
+        # Code39 barcode — pushed down to clear the taller font-4 price (~32 dots)
+        tspl.append(f'BARCODE {LM},95,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
 
         # SKU (very bottom, small font)
         tspl.append(f'TEXT {LM},215,"1",0,1,1,"{self._tspl_escape(sku)}"')

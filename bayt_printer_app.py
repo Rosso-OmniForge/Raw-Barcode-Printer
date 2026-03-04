@@ -247,23 +247,45 @@ class PrintJob(QThread):
     
     def _format_price(self, price_cents: int, currency: str = "ZAR") -> str:
         """Format price for display."""
-        if currency == "ZAR":
-            symbol = "R"
-        else:
-            symbol = currency
-        
-        price = price_cents / 100
-        return f"{symbol}{price:.2f}"
+        symbol = "R" if currency == "ZAR" else currency
+        return f"{symbol}{price_cents / 100:.2f}"
+
+    _FONT_CHAR_W = {'1': 8, '2': 12, '3': 16, '4': 24, '5': 32}
+
+    def _wrap_text(self, text: str, font: str, max_dots: int) -> list:
+        """
+        Wrap *text* to at most 2 lines so each line fits within *max_dots*.
+        Splits at word boundaries; hard-breaks a single long word if needed.
+        """
+        cw = self._FONT_CHAR_W.get(str(font), 8)
+        max_chars = max(1, max_dots // cw)
+
+        if len(text) <= max_chars:
+            return [text]
+
+        # Try to split at a word boundary
+        words = text.split()
+        line1 = ''
+        for word in words:
+            candidate = (line1 + ' ' + word).strip()
+            if len(candidate) <= max_chars:
+                line1 = candidate
+            else:
+                break
+
+        if not line1:                      # single word longer than max_chars
+            line1 = text[:max_chars]
+        line2 = text[len(line1):].strip()[:max_chars]  # hard-truncate remainder
+        return [line1, line2] if line2 else [line1]
     
     def _generate_label_tspl(self, item: Dict[str, Any]) -> str:
         """Generate TSPL commands for a single label."""
-        title = (item.get("title") or "")[:30]  # Truncate if too long
+        title         = (item.get("title") or "")
         variant_label = item.get("variant_label") or ""
-        sku = item.get("sku") or ""
-        code39 = item.get("code39") or sku
-        price = self._format_price(item.get("price_cents", 0), item.get("currency", "ZAR"))
-        
-        # Build TSPL command
+        sku           = item.get("sku") or ""
+        code39        = item.get("code39") or sku
+        price         = self._format_price(item.get("price_cents", 0), item.get("currency", "ZAR"))
+
         tspl = []
         tspl.append("SIZE 40 mm, 30 mm")
         tspl.append("GAP 2 mm, 0 mm")
@@ -275,32 +297,38 @@ class PrintJob(QThread):
         tspl.append("SET PARTIAL_CUTTER OFF")
         tspl.append("SET TEAR ON")
         tspl.append("CLS")
-        
-        # All elements are left-aligned at a consistent left margin.
-        # Centering was causing content to be cut off on short/long strings.
-        LM = 10   # left margin in dots
 
-        # Title (top)
-        tspl.append(f'TEXT {LM},5,"3",0,1,1,"{self._tspl_escape(title)}"')
+        LM         = 10                                  # left margin (dots)
+        USABLE_W   = self.label_width_dots - LM * 2     # 300 dots printable width
+        TITLE_FONT = "3"                                 # 16 dots/char
+        TITLE_LINE_H = 26                                # font-3 height (24) + 2 gap
 
-        # Variant label (below title)
+        # ── Title (wraps to 2 lines if needed) ───────────────────────
+        title_lines = self._wrap_text(title, TITLE_FONT, USABLE_W)
+        tspl.append(f'TEXT {LM},5,"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[0])}"')
+        if len(title_lines) > 1:
+            tspl.append(f'TEXT {LM},{5 + TITLE_LINE_H},"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[1])}"')
+
+        # Shift all elements below the title down when title occupies 2 lines
+        extra = TITLE_LINE_H if len(title_lines) > 1 else 0
+
+        # ── Variant label ─────────────────────────────────────────────
         if variant_label:
-            tspl.append(f'TEXT {LM},27,"2",0,1,1,"{self._tspl_escape(variant_label)}"')
+            tspl.append(f'TEXT {LM},{27 + extra},"2",0,1,1,"{self._tspl_escape(variant_label)}"')
 
-        # Separator bar — full printable width
-        tspl.append(f"BAR {LM},44,{self.label_width_dots - LM * 2},2")
+        # ── Separator bar — full printable width ─────────────────────
+        tspl.append(f"BAR {LM},{44 + extra},{USABLE_W},2")
 
-        # Price — font 4 (one step larger), with extra spacing below the separator
-        tspl.append(f'TEXT {LM},56,"4",0,1,1,"{self._tspl_escape(price)}"')
+        # ── Price (font 4, one step up from font 3) ───────────────────
+        tspl.append(f'TEXT {LM},{56 + extra},"4",0,1,1,"{self._tspl_escape(price)}"')
 
-        # Code39 barcode — pushed down to clear the taller font-4 price (~32 dots)
-        tspl.append(f'BARCODE {LM},95,"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
+        # ── Code39 barcode ────────────────────────────────────────────
+        tspl.append(f'BARCODE {LM},{95 + extra},"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
 
-        # SKU (very bottom, small font)
+        # ── SKU (bottom, small font) ──────────────────────────────────
         tspl.append(f'TEXT {LM},215,"1",0,1,1,"{self._tspl_escape(sku)}"')
-        
+
         tspl.append("PRINT 1")
-        
         return "\n".join(tspl) + "\n"
     
     def run(self):
